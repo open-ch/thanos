@@ -322,7 +322,7 @@ func runReceive(
 			statusProber.Healthy()
 			return srv.ListenAndServe()
 		}, func(err error) {
-			statusProber.NotReady(err)
+			// statusProber.NotReady(err)
 			defer statusProber.NotHealthy(err)
 
 			srv.Shutdown(err)
@@ -394,7 +394,7 @@ func runReceive(
 				return srv.ListenAndServe()
 			},
 			func(err error) {
-				statusProber.NotReady(err)
+				// statusProber.NotReady(err)
 				defer statusProber.NotHealthy(err)
 
 				srv.Shutdown(err)
@@ -487,6 +487,8 @@ func runReceive(
 			}
 		})
 	}
+
+	statusProber.Ready()
 
 	level.Info(logger).Log("msg", "starting receiver")
 	return nil
@@ -591,7 +593,7 @@ func setupHashring(g *run.Group,
 					hashringChangedChan <- struct{}{}
 				} else {
 					// If not, just signal we are ready (this is important during first hashring load)
-					statusProber.Ready()
+					// statusProber.Ready()
 				}
 			case <-cancel:
 				return nil
@@ -674,7 +676,7 @@ func startTSDBAndUpload(g *run.Group,
 				flushHead := !initialized || hashringAlgorithm != receive.AlgorithmKetama
 				if flushHead {
 					msg := "hashring has changed; server is not ready to receive requests"
-					statusProber.NotReady(errors.New(msg))
+					// statusProber.NotReady(errors.New(msg))
 					level.Info(logger).Log("msg", msg)
 
 					level.Info(logger).Log("msg", "updating storage")
@@ -690,7 +692,7 @@ func startTSDBAndUpload(g *run.Group,
 						<-uploadDone
 					}
 					dbUpdatesCompleted.Inc()
-					statusProber.Ready()
+					// statusProber.Ready()
 					level.Info(logger).Log("msg", "storage started, and server is ready to receive requests")
 					dbUpdatesCompleted.Inc()
 				}
