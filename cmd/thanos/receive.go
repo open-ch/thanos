@@ -507,6 +507,8 @@ func runReceive(
 		})
 	}
 
+	statusProber.Ready()
+
 	level.Info(logger).Log("msg", "starting receiver")
 	return nil
 }
@@ -610,7 +612,7 @@ func setupHashring(g *run.Group,
 					hashringChangedChan <- struct{}{}
 				} else {
 					// If not, just signal we are ready (this is important during first hashring load)
-					statusProber.Ready()
+					// statusProber.Ready()
 				}
 			case <-cancel:
 				return nil
@@ -709,7 +711,7 @@ func startTSDBAndUpload(g *run.Group,
 						<-uploadDone
 					}
 					dbUpdatesCompleted.Inc()
-					statusProber.Ready()
+					// statusProber.Ready()
 					level.Info(logger).Log("msg", "storage started, and server is ready to receive requests")
 					dbUpdatesCompleted.Inc()
 				}
