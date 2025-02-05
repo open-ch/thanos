@@ -322,7 +322,7 @@ func runReceive(
 			statusProber.Healthy()
 			return srv.ListenAndServe()
 		}, func(err error) {
-			// statusProber.NotReady(err)
+			statusProber.NotReady(err)
 			defer statusProber.NotHealthy(err)
 
 			srv.Shutdown(err)
@@ -394,7 +394,7 @@ func runReceive(
 				return srv.ListenAndServe()
 			},
 			func(err error) {
-				// statusProber.NotReady(err)
+				statusProber.NotReady(err)
 				defer statusProber.NotHealthy(err)
 
 				srv.Shutdown(err)
@@ -676,7 +676,7 @@ func startTSDBAndUpload(g *run.Group,
 				flushHead := !initialized || hashringAlgorithm != receive.AlgorithmKetama
 				if flushHead {
 					msg := "hashring has changed; server is not ready to receive requests"
-					// statusProber.NotReady(errors.New(msg))
+					statusProber.NotReady(errors.New(msg))
 					level.Info(logger).Log("msg", msg)
 
 					level.Info(logger).Log("msg", "updating storage")
