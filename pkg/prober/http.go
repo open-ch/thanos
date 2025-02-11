@@ -6,6 +6,7 @@ package prober
 import (
 	"io"
 	"net/http"
+	"runtime/debug"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -61,6 +62,7 @@ func (p *HTTPProbe) isHealthy() bool {
 
 // Ready sets components status to ready.
 func (p *HTTPProbe) Ready() {
+	debug.PrintStack()
 	p.ready.Swap(1)
 }
 

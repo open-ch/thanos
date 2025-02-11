@@ -341,11 +341,16 @@ func (t *MultiTSDB) Open() error {
 		}
 
 		g.Go(func() error {
+			fmt.Println("Loading Tenant", f.Name())
+			defer fmt.Println("Done Loading Tenant", f.Name())
+
 			_, err := t.getOrLoadTenant(f.Name(), true)
 			return err
 		})
 	}
 
+	fmt.Println("Waiting for all tenants")
+	defer fmt.Println("Done waiting for all tenants")
 	return g.Wait()
 }
 
