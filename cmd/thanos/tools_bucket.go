@@ -1784,18 +1784,28 @@ func runMigration(
 
 	for i := 0; i < config.concurrency; i++ {
 		wg.Add(1)
-		go func() {
+		workerID := i + 1
+		go func(workerID int) {
 			defer wg.Done()
+			workerLogger := log.With(logger, "worker_id", workerID)
+			level.Info(workerLogger).Log("msg", "Worker started", "concurrency", config.concurrency)
+			
+			blocksProcessed := 0
 			for meta := range blockChan {
-				if err := migrateBlock(migrationCtx, logger, fromInsBkt, toInsBkt, meta, config); err != nil {
+				blocksProcessed++
+				level.Info(workerLogger).Log("msg", "Worker processing block", "block", meta.ULID.String(), "blocks_processed_by_worker", blocksProcessed)
+				
+				startTime := time.Now()
+				if err := migrateBlock(migrationCtx, workerLogger, fromInsBkt, toInsBkt, meta, config); err != nil {
 					if err == errBlockAlreadyExists {
 						// Block already exists, count as skipped
 						countMutex.Lock()
 						skippedCount++
 						countMutex.Unlock()
+						level.Info(workerLogger).Log("msg", "Block already exists, skipped", "block", meta.ULID.String(), "duration", time.Since(startTime))
 						continue
 					}
-					level.Error(logger).Log("msg", "Failed to migrate block", "block", meta.ULID.String(), "err", err)
+					level.Error(workerLogger).Log("msg", "Failed to migrate block", "block", meta.ULID.String(), "err", err, "duration", time.Since(startTime))
 					errorChan <- errors.Wrap(err, "migrate block "+meta.ULID.String())
 					return
 				}
@@ -1803,9 +1813,10 @@ func runMigration(
 				countMutex.Lock()
 				migratedCount++
 				countMutex.Unlock()
-				level.Info(logger).Log("msg", "Successfully migrated block", "block", meta.ULID.String())
+				level.Info(workerLogger).Log("msg", "Successfully migrated block", "block", meta.ULID.String(), "duration", time.Since(startTime))
 			}
-		}()
+			level.Info(workerLogger).Log("msg", "Worker finished", "total_blocks_processed", blocksProcessed)
+		}(workerID)
 	}
 
 	// Wait for all workers to complete
@@ -1835,13 +1846,16 @@ func migrateBlock(
 	config *bucketMigrateConfig,
 ) error {
 	blockID := meta.ULID
+	startTime := time.Now()
 	level.Debug(logger).Log("msg", "Starting block migration", "block", blockID.String())
 
 	// Check if block already exists in destination
+	checkStartTime := time.Now()
 	destExists, err := toBkt.Exists(ctx, filepath.Join(blockID.String(), block.MetaFilename))
 	if err != nil {
 		return errors.Wrap(err, "check if block exists in destination")
 	}
+	level.Debug(logger).Log("msg", "Destination check completed", "block", blockID.String(), "exists", destExists, "check_duration", time.Since(checkStartTime))
 
 	if destExists && !config.overwriteExisting {
 		level.Info(logger).Log("msg", "Block already exists in destination, skipping", "block", blockID.String())
@@ -1859,6 +1873,7 @@ func migrateBlock(
 	}
 
 	// Add chunk files
+	listStartTime := time.Now()
 	err = fromBkt.Iter(ctx, filepath.Join(blockID.String(), block.ChunksDirname+"/"), func(name string) error {
 		if filepath.Base(name) != block.ChunksDirname {
 			blockFiles = append(blockFiles, strings.TrimPrefix(name, blockID.String()+"/"))
@@ -1868,10 +1883,15 @@ func migrateBlock(
 	if err != nil {
 		return errors.Wrap(err, "list chunk files")
 	}
+	level.Debug(logger).Log("msg", "File listing completed", "block", blockID.String(), "files_count", len(blockFiles), "list_duration", time.Since(listStartTime))
 
 	// Copy each file with retry logic
-	for _, file := range blockFiles {
+	copyStartTime := time.Now()
+	for i, file := range blockFiles {
+		fileStartTime := time.Now()
 		srcPath := filepath.Join(blockID.String(), file)
+
+		level.Info(logger).Log("msg", "Copying file", "block", blockID.String(), "file", file, "progress", fmt.Sprintf("%d/%d", i+1, len(blockFiles)))
 
 		err := runutil.Retry(time.Second, ctx.Done(), func() error {
 			reader, err := fromBkt.Get(ctx, srcPath)
@@ -1884,14 +1904,19 @@ func migrateBlock(
 		})
 
 		if err != nil {
+			level.Error(logger).Log("msg", "Failed to copy file", "block", blockID.String(), "file", file, "err", err)
 			return errors.Wrapf(err, "copy file %s", file)
 		}
 
-		level.Debug(logger).Log("msg", "Copied file", "block", blockID.String(), "file", file)
+		level.Debug(logger).Log("msg", "File copied successfully", "block", blockID.String(), "file", file, "file_duration", time.Since(fileStartTime))
 	}
+	level.Info(logger).Log("msg", "All files copied", "block", blockID.String(), "files_count", len(blockFiles), "copy_duration", time.Since(copyStartTime))
 
 	// Mark source block for deletion only after successful replication
+	markStartTime := time.Now()
 	deletionMarkPath := filepath.Join(blockID.String(), metadata.DeletionMarkFilename)
+	level.Info(logger).Log("msg", "Creating deletion mark", "block", blockID.String())
+	
 	deletionMark := metadata.DeletionMark{
 		ID:           blockID,
 		DeletionTime: time.Now().Unix(),
@@ -1908,9 +1933,11 @@ func migrateBlock(
 		return fromBkt.Upload(ctx, deletionMarkPath, bytes.NewReader(deletionMarkJSON))
 	})
 	if err != nil {
+		level.Error(logger).Log("msg", "Failed to create deletion mark", "block", blockID.String(), "path", deletionMarkPath, "err", err)
 		return errors.Wrap(err, "mark source block for deletion")
 	}
+	level.Info(logger).Log("msg", "Deletion mark created successfully", "block", blockID.String(), "path", deletionMarkPath, "mark_duration", time.Since(markStartTime))
 
-	level.Info(logger).Log("msg", "Block migration completed", "block", blockID.String())
+	level.Info(logger).Log("msg", "Block migration completed", "block", blockID.String(), "total_duration", time.Since(startTime), "files_copied", len(blockFiles))
 	return nil
 }
