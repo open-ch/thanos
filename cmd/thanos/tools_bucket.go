@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/csv"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -33,6 +35,7 @@ import (
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"golang.org/x/text/language"
@@ -66,6 +69,9 @@ import (
 	"github.com/thanos-io/thanos/pkg/ui"
 	"github.com/thanos-io/thanos/pkg/verifier"
 )
+
+// errBlockAlreadyExists is returned when a block already exists in destination
+var errBlockAlreadyExists = errors.New("block already exists in destination")
 
 const extpromPrefix = "thanos_bucket_"
 
@@ -132,6 +138,14 @@ type bucketReplicateConfig struct {
 	compactions []int
 	matcherStrs string
 	singleRun   bool
+}
+
+type bucketMigrateConfig struct {
+	dryRun                bool
+	overwriteExisting     bool
+	excludeDeleteMarked   bool
+	concurrency           int
+	selectorRelabelConfig *extflag.PathOrContent
 }
 
 type bucketDownsampleConfig struct {
@@ -233,6 +247,18 @@ func (tbc *bucketReplicateConfig) registerBucketReplicateFlag(cmd extkingpin.Fla
 	return tbc
 }
 
+func (tbc *bucketMigrateConfig) registerBucketMigrateFlag(cmd extkingpin.FlagClause) *bucketMigrateConfig {
+	cmd.Flag("dry-run", "Preview mode - shows blocks that would be migrated without performing the actual migration. Useful for testing filters and cutoff times.").Default("false").BoolVar(&tbc.dryRun)
+
+	cmd.Flag("overwrite-existing", "Overwrite blocks that already exist in destination storage. By default, existing blocks are skipped to ensure idempotent behavior.").Default("false").BoolVar(&tbc.overwriteExisting)
+
+	cmd.Flag("exclude-delete-marked", "Skip blocks that are already marked for deletion in the source storage. This prevents re-processing of already migrated blocks.").Default("true").BoolVar(&tbc.excludeDeleteMarked)
+
+	cmd.Flag("concurrency", "Number of concurrent migration operations. Higher values increase throughput but also resource usage.").Default("10").IntVar(&tbc.concurrency)
+
+	return tbc
+}
+
 func (tbc *bucketRewriteConfig) registerBucketRewriteFlag(cmd extkingpin.FlagClause) *bucketRewriteConfig {
 	cmd.Flag("id", "ID (ULID) of the blocks for rewrite (repeated flag).").Required().StringsVar(&tbc.blockIDs)
 	cmd.Flag("tmp.dir", "Working directory for temporary files").Default(filepath.Join(os.TempDir(), "thanos-rewrite")).StringVar(&tbc.tmpDir)
@@ -301,6 +327,7 @@ func registerBucket(app extkingpin.AppClause) {
 	registerBucketInspect(cmd, objStoreConfig)
 	registerBucketWeb(cmd, objStoreConfig)
 	registerBucketReplicate(cmd, objStoreConfig)
+	registerBucketMigrate(cmd, objStoreConfig)
 	registerBucketDownsample(cmd, objStoreConfig)
 	registerBucketCleanup(cmd, objStoreConfig)
 	registerBucketMarkBlock(cmd, objStoreConfig)
@@ -787,6 +814,112 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 			maxTime,
 			blockIDs,
 			*ignoreMarkedForDeletion,
+		)
+	})
+}
+
+func registerBucketMigrate(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
+	cmd := app.Command("migrate", `Migrate TSDB blocks from source to destination storage based on configurable time cutoffs.
+
+This command migrates blocks older than the specified cutoff from source (hot) to destination (cold) storage.
+Migrated blocks are marked for deletion in the source storage but remain available until cleanup.
+
+Examples:
+  # Migrate blocks older than 30 days from hot to cold storage
+  thanos tools bucket migrate --older-than=30d --objstore.config-file=hot.yaml --objstore-to.config-file=cold.yaml
+
+  # Dry run to see what would be migrated
+  thanos tools bucket migrate --older-than=2025-06-01T00:00:00Z --dry-run --objstore.config-file=hot.yaml --objstore-to.config-file=cold.yaml
+
+  # Migrate with specific selector and concurrency
+  thanos tools bucket migrate --older-than=7d --concurrency=5 --selector.relabel-config=selector.yaml --objstore.config-file=hot.yaml --objstore-to.config-file=cold.yaml
+
+Features:
+  - Supports both RFC3339 absolute times and relative durations
+  - Concurrent block migration for performance
+  - Idempotent operation - safe to run multiple times
+  - Block filtering with relabel configuration
+  - Automatic deletion marking of migrated blocks
+  - Comprehensive dry-run mode for preview`)
+
+	toObjStoreConfig := extkingpin.RegisterCommonObjStoreFlags(cmd, "-to", false, "The destination object storage to migrate blocks to.")
+
+	tbc := &bucketMigrateConfig{}
+	tbc.registerBucketMigrateFlag(cmd)
+
+	// Add the older-than flag using TimeOrDuration for proper parsing
+	olderThan := model.TimeOrDuration(cmd.Flag("older-than", `Migrate blocks older than this time cutoff. 
+		
+Supports two formats:
+  - RFC3339 absolute time: 2025-06-01T00:00:00Z, 2025-12-31T23:59:59+02:00
+  - Relative duration: 30d (30 days), 12h (12 hours), 2w (2 weeks), 1y (1 year)
+  
+Valid duration units: ms, s, m, h, d, w, y
+Examples: 7d, 24h, 2w, 3m, 90d, 1y`).Required())
+
+	// Add selector.relabel-config support similar to bucket web command
+	tbc.selectorRelabelConfig = extkingpin.RegisterSelectorRelabelFlags(cmd)
+
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+		// Dummy actor to immediately kill the group after the run function returns.
+		g.Add(func() error { return nil }, func(error) {})
+
+		// Parse relabel config if provided
+		var relabelConfig []*relabel.Config
+		if tbc.selectorRelabelConfig != nil {
+			relabelContentYaml, err := tbc.selectorRelabelConfig.Content()
+			if err != nil {
+				return errors.Wrap(err, "get content of relabeling configuration")
+			}
+
+			if len(relabelContentYaml) > 0 {
+				if err := yaml.Unmarshal(relabelContentYaml, &relabelConfig); err != nil {
+					return errors.Wrap(err, "parsing relabeling configuration")
+				}
+			}
+		}
+
+		// Initialize source storage
+		fromConfContentYaml, err := objStoreConfig.Content()
+		if err != nil {
+			return errors.Wrap(err, "get source object store configuration")
+		}
+		if len(fromConfContentYaml) == 0 {
+			return errors.New("no source storage configuration provided")
+		}
+
+		fromBkt, err := client.NewBucket(logger, fromConfContentYaml, component.Bucket.String(), nil)
+		if err != nil {
+			return errors.Wrap(err, "create source bucket client")
+		}
+		fromBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), fromBkt.Name()))
+
+		// Initialize destination storage
+		toConfContentYaml, err := toObjStoreConfig.Content()
+		if err != nil {
+			return errors.Wrap(err, "get destination object store configuration")
+		}
+		if len(toConfContentYaml) == 0 {
+			return errors.New("no destination storage configuration provided")
+		}
+
+		toBkt, err := client.NewBucket(logger, toConfContentYaml, component.Bucket.String(), nil)
+		if err != nil {
+			return errors.Wrap(err, "create destination bucket client")
+		}
+		toBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), toBkt.Name()))
+
+		defer runutil.CloseWithLogOnErr(logger, fromBkt, "source bucket client")
+		defer runutil.CloseWithLogOnErr(logger, toBkt, "destination bucket client")
+
+		return runMigration(
+			logger,
+			reg,
+			fromBkt,
+			toBkt,
+			olderThan,
+			tbc,
+			relabelConfig,
 		)
 	})
 }
@@ -1488,4 +1621,291 @@ func registerBucketUploadBlocks(app extkingpin.AppClause, objStoreConfig *extfla
 
 		return nil
 	})
+}
+
+// runMigration executes the block migration process
+func runMigration(
+	logger log.Logger,
+	reg *prometheus.Registry,
+	fromBkt objstore.Bucket,
+	toBkt objstore.Bucket,
+	olderThan *model.TimeOrDurationValue,
+	config *bucketMigrateConfig,
+	relabelConfig []*relabel.Config,
+) error {
+	level.Info(logger).Log("msg", "Starting migration process", "dry-run", config.dryRun)
+
+	// Wrap buckets with instrumentation
+	fromInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), fromBkt.Name()))
+	toInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), toBkt.Name()))
+
+	// Create base block ID fetcher
+	baseBlockIDsFetcher := block.NewConcurrentLister(logger, fromInsBkt)
+
+	// Create filters for block discovery
+	var filters []block.MetadataFilter
+
+	// Add ignore deletion mark filter if requested
+	if config.excludeDeleteMarked {
+		filters = append(filters, block.NewIgnoreDeletionMarkFilter(logger, fromInsBkt, 0, block.FetcherConcurrency))
+	}
+
+	// Create meta fetcher with filters
+	fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, fromInsBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), filters)
+	if err != nil {
+		return errors.Wrap(err, "create meta fetcher")
+	}
+
+	// Discover blocks
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	metas, _, err := fetcher.Fetch(ctx)
+	if err != nil {
+		return errors.Wrap(err, "fetch block metadata")
+	}
+
+	level.Info(logger).Log("msg", "Discovered blocks", "total", len(metas))
+
+	// Apply time-based filtering (blocks older than cutoff)
+	var cutoffTime int64
+	if olderThan.Time != nil {
+		// Absolute time specified
+		cutoffTime = timestamp.FromTime(*olderThan.Time)
+	} else if olderThan.Dur != nil {
+		// Relative duration specified - subtract from current time to get cutoff
+		cutoffTime = timestamp.FromTime(time.Now().Add(-time.Duration(*olderThan.Dur)))
+	} else {
+		return errors.New("invalid older-than value")
+	}
+
+	level.Info(logger).Log("msg", "Time filter cutoff", "cutoff", cutoffTime, "cutoff_time", time.Unix(cutoffTime/1000, 0).Format(time.RFC3339))
+	filteredMetas := make(map[ulid.ULID]*metadata.Meta)
+	for id, meta := range metas {
+		// Include blocks where maxTime < cutoff (block is completely older than cutoff)
+		if meta.MaxTime < cutoffTime {
+			filteredMetas[id] = meta
+			level.Debug(logger).Log("msg", "Block included", "block", id.String(), "maxTime", meta.MaxTime, "cutoff", cutoffTime)
+		} else {
+			level.Debug(logger).Log("msg", "Block too recent, skipping", "block", id.String(), "maxTime", meta.MaxTime, "cutoff", cutoffTime)
+		}
+	}
+	metas = filteredMetas
+	level.Info(logger).Log("msg", "Applied time filtering", "remaining", len(metas))
+
+	// Apply relabel config filtering if provided
+	if len(relabelConfig) > 0 {
+		finalMetas := make(map[ulid.ULID]*metadata.Meta)
+		for id, meta := range metas {
+			lbls := labels.FromMap(meta.Thanos.Labels)
+			processedLabels, _ := relabel.Process(lbls, relabelConfig...)
+			if len(processedLabels) > 0 {
+				finalMetas[id] = meta
+			} else {
+				level.Debug(logger).Log("msg", "Block filtered out by relabel config", "block", id.String())
+			}
+		}
+		metas = finalMetas
+		level.Info(logger).Log("msg", "Applied relabel filtering", "remaining", len(metas))
+	}
+
+	if len(metas) == 0 {
+		level.Info(logger).Log("msg", "No blocks found for migration")
+		return nil
+	}
+
+	// Log blocks that will be migrated
+	for id, meta := range metas {
+		level.Info(logger).Log(
+			"msg", "Block selected for migration",
+			"block", id.String(),
+			"minTime", time.Unix(meta.MinTime/1000, 0).Format(time.RFC3339),
+			"maxTime", time.Unix(meta.MaxTime/1000, 0).Format(time.RFC3339),
+			"samples", meta.Stats.NumSamples,
+			"series", meta.Stats.NumSeries,
+		)
+	}
+	if config.dryRun {
+		level.Info(logger).Log("msg", "Dry run completed", "blocks_to_migrate", len(metas))
+		return nil
+	}
+
+	// Perform actual migration
+	level.Info(logger).Log("msg", "Starting block migration", "blocks", len(metas), "concurrency", config.concurrency)
+
+	// Create context for migration operations
+	migrationCtx, migrationCancel := context.WithCancel(ctx)
+	defer migrationCancel()
+
+	// Create channel for blocks to migrate
+	blockChan := make(chan *metadata.Meta, len(metas))
+
+	// Sort blocks by minTime (oldest first) to prevent compaction races
+	sortedMetas := make([]*metadata.Meta, 0, len(metas))
+	for _, meta := range metas {
+		sortedMetas = append(sortedMetas, meta)
+	}
+	sort.Slice(sortedMetas, func(i, j int) bool {
+		return sortedMetas[i].MinTime < sortedMetas[j].MinTime
+	})
+
+	// Send blocks to channel
+	for _, meta := range sortedMetas {
+		blockChan <- meta
+	}
+	close(blockChan)
+
+	// Create worker pool for concurrent migration
+	var wg sync.WaitGroup
+	errorChan := make(chan error, config.concurrency)
+	var migratedCount, skippedCount, totalBlocks int64
+	var countMutex sync.Mutex
+	
+	totalBlocks = int64(len(metas))
+	
+	// Progress reporting ticker
+	progressTicker := time.NewTicker(30 * time.Second)
+	defer progressTicker.Stop()
+	go func() {
+		for range progressTicker.C {
+			countMutex.Lock()
+			current := migratedCount + skippedCount
+			countMutex.Unlock()
+			if current < totalBlocks {
+				level.Info(logger).Log("msg", "Migration progress", "processed", current, "total", totalBlocks, "migrated", migratedCount, "skipped", skippedCount)
+			}
+		}
+	}()
+
+	for i := 0; i < config.concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for meta := range blockChan {
+				if err := migrateBlock(migrationCtx, logger, fromInsBkt, toInsBkt, meta, config); err != nil {
+					if err == errBlockAlreadyExists {
+						// Block already exists, count as skipped
+						countMutex.Lock()
+						skippedCount++
+						countMutex.Unlock()
+						continue
+					}
+					level.Error(logger).Log("msg", "Failed to migrate block", "block", meta.ULID.String(), "err", err)
+					errorChan <- errors.Wrap(err, "migrate block "+meta.ULID.String())
+					return
+				}
+				// Count successful migrations
+				countMutex.Lock()
+				migratedCount++
+				countMutex.Unlock()
+				level.Info(logger).Log("msg", "Successfully migrated block", "block", meta.ULID.String())
+			}
+		}()
+	}
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(errorChan)
+	}()
+
+	// Check for errors
+	for err := range errorChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	level.Info(logger).Log("msg", "Migration completed successfully", "migrated_blocks", migratedCount, "skipped_blocks", skippedCount)
+	return nil
+}
+
+// migrateBlock migrates a single block from source to destination storage
+func migrateBlock(
+	ctx context.Context,
+	logger log.Logger,
+	fromBkt objstore.Bucket,
+	toBkt objstore.Bucket,
+	meta *metadata.Meta,
+	config *bucketMigrateConfig,
+) error {
+	blockID := meta.ULID
+	level.Debug(logger).Log("msg", "Starting block migration", "block", blockID.String())
+
+	// Check if block already exists in destination
+	destExists, err := toBkt.Exists(ctx, filepath.Join(blockID.String(), block.MetaFilename))
+	if err != nil {
+		return errors.Wrap(err, "check if block exists in destination")
+	}
+
+	if destExists && !config.overwriteExisting {
+		level.Info(logger).Log("msg", "Block already exists in destination, skipping", "block", blockID.String())
+		return errBlockAlreadyExists // Return special error to distinguish from actual failures
+	}
+
+	if destExists && config.overwriteExisting {
+		level.Info(logger).Log("msg", "Block exists in destination, overwriting", "block", blockID.String())
+	}
+
+	// Copy all block files with retries
+	blockFiles := []string{
+		block.MetaFilename,
+		block.IndexFilename,
+	}
+
+	// Add chunk files
+	err = fromBkt.Iter(ctx, filepath.Join(blockID.String(), block.ChunksDirname+"/"), func(name string) error {
+		if filepath.Base(name) != block.ChunksDirname {
+			blockFiles = append(blockFiles, strings.TrimPrefix(name, blockID.String()+"/"))
+		}
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "list chunk files")
+	}
+
+	// Copy each file with retry logic
+	for _, file := range blockFiles {
+		srcPath := filepath.Join(blockID.String(), file)
+
+		err := runutil.Retry(time.Second, ctx.Done(), func() error {
+			reader, err := fromBkt.Get(ctx, srcPath)
+			if err != nil {
+				return errors.Wrap(err, "get source file")
+			}
+			defer runutil.CloseWithLogOnErr(logger, reader, "source file reader")
+
+			return toBkt.Upload(ctx, srcPath, reader)
+		})
+
+		if err != nil {
+			return errors.Wrapf(err, "copy file %s", file)
+		}
+
+		level.Debug(logger).Log("msg", "Copied file", "block", blockID.String(), "file", file)
+	}
+
+	// Mark source block for deletion only after successful replication
+	deletionMarkPath := filepath.Join(blockID.String(), metadata.DeletionMarkFilename)
+	deletionMark := metadata.DeletionMark{
+		ID:           blockID,
+		DeletionTime: time.Now().Unix(),
+		Version:      metadata.DeletionMarkVersion1,
+		Details:      "Block migrated by thanos bucket migrate tool",
+	}
+
+	deletionMarkJSON, err := json.Marshal(deletionMark)
+	if err != nil {
+		return errors.Wrap(err, "marshal deletion mark")
+	}
+
+	err = runutil.Retry(time.Second, ctx.Done(), func() error {
+		return fromBkt.Upload(ctx, deletionMarkPath, bytes.NewReader(deletionMarkJSON))
+	})
+	if err != nil {
+		return errors.Wrap(err, "mark source block for deletion")
+	}
+
+	level.Info(logger).Log("msg", "Block migration completed", "block", blockID.String())
+	return nil
 }
