@@ -1635,9 +1635,13 @@ func runMigration(
 ) error {
 	level.Info(logger).Log("msg", "Starting migration process", "dry-run", config.dryRun)
 
-	// Wrap buckets with instrumentation
-	fromInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), fromBkt.Name()))
-	toInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), toBkt.Name()))
+	// Create separate registries for internal metrics to avoid conflicts
+	sourceReg := prometheus.NewRegistry()
+	destReg := prometheus.NewRegistry()
+	
+	// Wrap buckets with instrumentation using separate registries
+	fromInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix("thanos_bucket_migrate_source", sourceReg), fromBkt.Name()))
+	toInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix("thanos_bucket_migrate_dest", destReg), toBkt.Name()))
 
 	// Create base block ID fetcher
 	baseBlockIDsFetcher := block.NewConcurrentLister(logger, fromInsBkt)
@@ -1650,8 +1654,9 @@ func runMigration(
 		filters = append(filters, block.NewIgnoreDeletionMarkFilter(logger, fromInsBkt, 0, block.FetcherConcurrency))
 	}
 
-	// Create meta fetcher with filters
-	fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, fromInsBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), filters)
+	// Create meta fetcher with filters using a separate registry
+	fetcherReg := prometheus.NewRegistry()
+	fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, fromInsBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix("thanos_bucket_migrate_fetcher", fetcherReg), filters)
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
 	}
