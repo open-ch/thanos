@@ -892,7 +892,7 @@ Examples: 7d, 24h, 2w, 3m, 90d, 1y`).Required())
 		if err != nil {
 			return errors.Wrap(err, "create source bucket client")
 		}
-		fromBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), fromBkt.Name()))
+		fromBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix(extpromPrefix+"_source", reg), fromBkt.Name()))
 
 		// Initialize destination storage
 		toConfContentYaml, err := toObjStoreConfig.Content()
@@ -907,7 +907,7 @@ Examples: 7d, 24h, 2w, 3m, 90d, 1y`).Required())
 		if err != nil {
 			return errors.Wrap(err, "create destination bucket client")
 		}
-		toBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix(extpromPrefix, reg), toBkt.Name()))
+		toBkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix(extpromPrefix+"_destination", reg), toBkt.Name()))
 
 		defer runutil.CloseWithLogOnErr(logger, fromBkt, "source bucket client")
 		defer runutil.CloseWithLogOnErr(logger, toBkt, "destination bucket client")
@@ -1760,9 +1760,9 @@ func runMigration(
 	errorChan := make(chan error, config.concurrency)
 	var migratedCount, skippedCount, totalBlocks int64
 	var countMutex sync.Mutex
-	
+
 	totalBlocks = int64(len(metas))
-	
+
 	// Progress reporting ticker
 	progressTicker := time.NewTicker(30 * time.Second)
 	defer progressTicker.Stop()
