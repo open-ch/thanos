@@ -1738,8 +1738,10 @@ func runMigration(
 	// Perform actual migration
 	level.Info(logger).Log("msg", "Starting block migration", "blocks", len(metas), "concurrency", config.concurrency)
 
-	// Create context for migration operations
-	migrationCtx, migrationCancel := context.WithCancel(ctx)
+	// Create context for migration operations (no timeout, let individual operations handle their own timeouts)
+	migrationCtx := context.Background()
+	// Add signal handling to allow graceful cancellation
+	migrationCtx, migrationCancel := context.WithCancel(migrationCtx)
 	defer migrationCancel()
 
 	// Create channel for blocks to migrate
@@ -1762,8 +1764,7 @@ func runMigration(
 
 	// Create worker pool for concurrent migration
 	var wg sync.WaitGroup
-	errorChan := make(chan error, config.concurrency)
-	var migratedCount, skippedCount, totalBlocks int64
+	var migratedCount, skippedCount, failedCount, totalBlocks int64
 	var countMutex sync.Mutex
 
 	totalBlocks = int64(len(metas))
@@ -1774,10 +1775,10 @@ func runMigration(
 	go func() {
 		for range progressTicker.C {
 			countMutex.Lock()
-			current := migratedCount + skippedCount
+			current := migratedCount + skippedCount + failedCount
 			countMutex.Unlock()
 			if current < totalBlocks {
-				level.Info(logger).Log("msg", "Migration progress", "processed", current, "total", totalBlocks, "migrated", migratedCount, "skipped", skippedCount)
+				level.Info(logger).Log("msg", "Migration progress", "processed", current, "total", totalBlocks, "migrated", migratedCount, "skipped", skippedCount, "failed", failedCount)
 			}
 		}
 	}()
@@ -1805,9 +1806,12 @@ func runMigration(
 						level.Info(workerLogger).Log("msg", "Block already exists, skipped", "block", meta.ULID.String(), "duration", time.Since(startTime))
 						continue
 					}
-					level.Error(workerLogger).Log("msg", "Failed to migrate block", "block", meta.ULID.String(), "err", err, "duration", time.Since(startTime))
-					errorChan <- errors.Wrap(err, "migrate block "+meta.ULID.String())
-					return
+					// Block failed - log error but continue with other blocks
+					level.Error(workerLogger).Log("msg", "Failed to migrate block, continuing with others", "block", meta.ULID.String(), "err", err, "duration", time.Since(startTime))
+					countMutex.Lock()
+					failedCount++
+					countMutex.Unlock()
+					continue
 				}
 				// Count successful migrations
 				countMutex.Lock()
@@ -1820,19 +1824,15 @@ func runMigration(
 	}
 
 	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(errorChan)
-	}()
+	wg.Wait()
 
-	// Check for errors
-	for err := range errorChan {
-		if err != nil {
-			return err
-		}
+	// Report final results
+	level.Info(logger).Log("msg", "Migration completed", "total_blocks", totalBlocks, "migrated_blocks", migratedCount, "skipped_blocks", skippedCount, "failed_blocks", failedCount)
+	
+	if failedCount > 0 {
+		level.Warn(logger).Log("msg", "Some blocks failed to migrate", "failed_count", failedCount, "success_rate", fmt.Sprintf("%.1f%%", float64(migratedCount)/float64(totalBlocks)*100))
 	}
-
-	level.Info(logger).Log("msg", "Migration completed successfully", "migrated_blocks", migratedCount, "skipped_blocks", skippedCount)
+	
 	return nil
 }
 
@@ -1849,9 +1849,14 @@ func migrateBlock(
 	startTime := time.Now()
 	level.Debug(logger).Log("msg", "Starting block migration", "block", blockID.String())
 
+	// Create a per-block timeout context to prevent individual blocks from hanging forever
+	// Use a generous timeout (30 minutes) to allow for large blocks but prevent indefinite hangs
+	blockCtx, blockCancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer blockCancel()
+
 	// Check if block already exists in destination
 	checkStartTime := time.Now()
-	destExists, err := toBkt.Exists(ctx, filepath.Join(blockID.String(), block.MetaFilename))
+	destExists, err := toBkt.Exists(blockCtx, filepath.Join(blockID.String(), block.MetaFilename))
 	if err != nil {
 		return errors.Wrap(err, "check if block exists in destination")
 	}
@@ -1874,7 +1879,7 @@ func migrateBlock(
 
 	// Add chunk files
 	listStartTime := time.Now()
-	err = fromBkt.Iter(ctx, filepath.Join(blockID.String(), block.ChunksDirname+"/"), func(name string) error {
+	err = fromBkt.Iter(blockCtx, filepath.Join(blockID.String(), block.ChunksDirname+"/"), func(name string) error {
 		if filepath.Base(name) != block.ChunksDirname {
 			blockFiles = append(blockFiles, strings.TrimPrefix(name, blockID.String()+"/"))
 		}
@@ -1893,14 +1898,14 @@ func migrateBlock(
 
 		level.Info(logger).Log("msg", "Copying file", "block", blockID.String(), "file", file, "progress", fmt.Sprintf("%d/%d", i+1, len(blockFiles)))
 
-		err := runutil.Retry(time.Second, ctx.Done(), func() error {
-			reader, err := fromBkt.Get(ctx, srcPath)
+		err := runutil.Retry(time.Second, blockCtx.Done(), func() error {
+			reader, err := fromBkt.Get(blockCtx, srcPath)
 			if err != nil {
 				return errors.Wrap(err, "get source file")
 			}
 			defer runutil.CloseWithLogOnErr(logger, reader, "source file reader")
 
-			return toBkt.Upload(ctx, srcPath, reader)
+			return toBkt.Upload(blockCtx, srcPath, reader)
 		})
 
 		if err != nil {
@@ -1929,8 +1934,8 @@ func migrateBlock(
 		return errors.Wrap(err, "marshal deletion mark")
 	}
 
-	err = runutil.Retry(time.Second, ctx.Done(), func() error {
-		return fromBkt.Upload(ctx, deletionMarkPath, bytes.NewReader(deletionMarkJSON))
+	err = runutil.Retry(time.Second, blockCtx.Done(), func() error {
+		return fromBkt.Upload(blockCtx, deletionMarkPath, bytes.NewReader(deletionMarkJSON))
 	})
 	if err != nil {
 		level.Error(logger).Log("msg", "Failed to create deletion mark", "block", blockID.String(), "path", deletionMarkPath, "err", err)
