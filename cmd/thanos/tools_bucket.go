@@ -180,6 +180,11 @@ type bucketUploadBlocksConfig struct {
 	labels []string
 }
 
+type bucketUfrumeConfig struct {
+	level  int
+	dryRun bool
+}
+
 func (tbc *bucketVerifyConfig) registerBucketVerifyFlag(cmd extkingpin.FlagClause) *bucketVerifyConfig {
 	cmd.Flag("repair", "Attempt to repair blocks for which issues were detected").
 		Short('r').Default("false").BoolVar(&tbc.repair)
@@ -318,6 +323,13 @@ func (tbc *bucketUploadBlocksConfig) registerBucketUploadBlocksFlag(cmd extkingp
 	return tbc
 }
 
+func (tbc *bucketUfrumeConfig) registerBucketUfrumeFlag(cmd extkingpin.FlagClause) *bucketUfrumeConfig {
+	cmd.Flag("level", "Maximum compaction level to set for blocks. Blocks with higher compaction levels will be updated to this level.").Default("5").IntVar(&tbc.level)
+	cmd.Flag("dry-run", "If true, don't actually modify blocks, just show what would be done.").Default("true").BoolVar(&tbc.dryRun)
+
+	return tbc
+}
+
 func registerBucket(app extkingpin.AppClause) {
 	cmd := app.Command("bucket", "Bucket utility commands")
 
@@ -334,6 +346,7 @@ func registerBucket(app extkingpin.AppClause) {
 	registerBucketRewrite(cmd, objStoreConfig)
 	registerBucketRetention(cmd, objStoreConfig)
 	registerBucketUploadBlocks(cmd, objStoreConfig)
+	registerBucketUfrume(cmd, objStoreConfig)
 }
 
 func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
@@ -1028,6 +1041,93 @@ func registerBucketCleanup(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 	})
 }
 
+func registerBucketUfrume(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
+	cmd := app.Command("ufrume", "Tidy up blocks by limiting their compaction level to a maximum value.")
+
+	tbc := &bucketUfrumeConfig{}
+	tbc.registerBucketUfrumeFlag(cmd)
+
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+		confContentYaml, err := objStoreConfig.Content()
+		if err != nil {
+			return err
+		}
+
+		bkt, err := client.NewBucket(logger, confContentYaml, component.Bucket.String(), nil)
+		if err != nil {
+			return err
+		}
+		insBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
+
+		baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+		fetcher, err := block.NewMetaFetcher(logger, block.FetcherConcurrency, insBkt, baseBlockIDsFetcher, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg), nil)
+		if err != nil {
+			return err
+		}
+
+		// Dummy actor to immediately kill the group after the run function returns.
+		g.Add(func() error { return nil }, func(error) {})
+
+		defer runutil.CloseWithLogOnErr(logger, insBkt, "bucket client")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		level.Info(logger).Log("msg", "fetching block metadata")
+		metas, _, err := fetcher.Fetch(ctx)
+		if err != nil {
+			return err
+		}
+
+		var blocksToUpdate []metadata.Meta
+		for _, meta := range metas {
+			if meta.Compaction.Level > tbc.level {
+				blocksToUpdate = append(blocksToUpdate, *meta)
+			}
+		}
+
+		level.Info(logger).Log("msg", "blocks found for compaction level update", "total_blocks", len(metas), "blocks_to_update", len(blocksToUpdate), "target_level", tbc.level)
+
+		if len(blocksToUpdate) == 0 {
+			level.Info(logger).Log("msg", "no blocks need updating")
+			return nil
+		}
+
+		if tbc.dryRun {
+			level.Info(logger).Log("msg", "dry-run mode enabled, showing blocks that would be updated")
+			for _, meta := range blocksToUpdate {
+				level.Info(logger).Log("msg", "would update block", "block_id", meta.ULID, "current_level", meta.Compaction.Level, "new_level", tbc.level)
+			}
+			return nil
+		}
+
+		level.Info(logger).Log("msg", "updating block compaction levels")
+		for _, meta := range blocksToUpdate {
+			level.Info(logger).Log("msg", "updating block compaction level", "block_id", meta.ULID, "current_level", meta.Compaction.Level, "new_level", tbc.level)
+
+			// Update the compaction level
+			meta.Compaction.Level = tbc.level
+
+			// Encode the updated metadata to JSON
+			var metaEncoded strings.Builder
+			if err := meta.Write(&metaEncoded); err != nil {
+				return errors.Wrapf(err, "encode meta file for block %s", meta.ULID)
+			}
+
+			// Upload the updated meta.json to the bucket
+			metaFilePath := filepath.Join(meta.ULID.String(), block.MetaFilename)
+			if err := insBkt.Upload(ctx, metaFilePath, strings.NewReader(metaEncoded.String())); err != nil {
+				return errors.Wrapf(err, "upload updated meta.json for block %s", meta.ULID)
+			}
+
+			level.Info(logger).Log("msg", "successfully updated block compaction level", "block_id", meta.ULID, "new_level", tbc.level)
+		}
+
+		level.Info(logger).Log("msg", "ufrume completed successfully", "blocks_updated", len(blocksToUpdate))
+		return nil
+	})
+}
+
 type tablePrinter func(w io.Writer, t Table) error
 
 func printTable(w io.Writer, t Table) error {
@@ -1638,7 +1738,7 @@ func runMigration(
 	// Create separate registries for internal metrics to avoid conflicts
 	sourceReg := prometheus.NewRegistry()
 	destReg := prometheus.NewRegistry()
-	
+
 	// Wrap buckets with instrumentation using separate registries
 	fromInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(fromBkt, extprom.WrapRegistererWithPrefix("thanos_bucket_migrate_source", sourceReg), fromBkt.Name()))
 	toInsBkt := objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(toBkt, extprom.WrapRegistererWithPrefix("thanos_bucket_migrate_dest", destReg), toBkt.Name()))
@@ -1790,12 +1890,12 @@ func runMigration(
 			defer wg.Done()
 			workerLogger := log.With(logger, "worker_id", workerID)
 			level.Info(workerLogger).Log("msg", "Worker started", "concurrency", config.concurrency)
-			
+
 			blocksProcessed := 0
 			for meta := range blockChan {
 				blocksProcessed++
 				level.Info(workerLogger).Log("msg", "Worker processing block", "block", meta.ULID.String(), "blocks_processed_by_worker", blocksProcessed)
-				
+
 				startTime := time.Now()
 				if err := migrateBlock(migrationCtx, workerLogger, fromInsBkt, toInsBkt, meta, config); err != nil {
 					if err == errBlockAlreadyExists {
@@ -1828,11 +1928,11 @@ func runMigration(
 
 	// Report final results
 	level.Info(logger).Log("msg", "Migration completed", "total_blocks", totalBlocks, "migrated_blocks", migratedCount, "skipped_blocks", skippedCount, "failed_blocks", failedCount)
-	
+
 	if failedCount > 0 {
 		level.Warn(logger).Log("msg", "Some blocks failed to migrate", "failed_count", failedCount, "success_rate", fmt.Sprintf("%.1f%%", float64(migratedCount)/float64(totalBlocks)*100))
 	}
-	
+
 	return nil
 }
 
@@ -1921,7 +2021,7 @@ func migrateBlock(
 	markStartTime := time.Now()
 	deletionMarkPath := filepath.Join(blockID.String(), metadata.DeletionMarkFilename)
 	level.Info(logger).Log("msg", "Creating deletion mark", "block", blockID.String())
-	
+
 	deletionMark := metadata.DeletionMark{
 		ID:           blockID,
 		DeletionTime: time.Now().Unix(),
