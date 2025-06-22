@@ -145,6 +145,7 @@ type bucketMigrateConfig struct {
 	overwriteExisting     bool
 	excludeDeleteMarked   bool
 	concurrency           int
+	blockTimeout          time.Duration
 	selectorRelabelConfig *extflag.PathOrContent
 }
 
@@ -260,6 +261,8 @@ func (tbc *bucketMigrateConfig) registerBucketMigrateFlag(cmd extkingpin.FlagCla
 	cmd.Flag("exclude-delete-marked", "Skip blocks that are already marked for deletion in the source storage. This prevents re-processing of already migrated blocks.").Default("true").BoolVar(&tbc.excludeDeleteMarked)
 
 	cmd.Flag("concurrency", "Number of concurrent migration operations. Higher values increase throughput but also resource usage.").Default("10").IntVar(&tbc.concurrency)
+
+	cmd.Flag("block-timeout", "Timeout for each individual block migration operation. Large blocks may require more time. Set to 0 to disable timeout. Examples: 30m, 1h, 2h30m").Default("30m").DurationVar(&tbc.blockTimeout)
 
 	return tbc
 }
@@ -1949,9 +1952,19 @@ func migrateBlock(
 	startTime := time.Now()
 	level.Debug(logger).Log("msg", "Starting block migration", "block", blockID.String())
 
-	// Create a per-block timeout context to prevent individual blocks from hanging forever
-	// Use a generous timeout (30 minutes) to allow for large blocks but prevent indefinite hangs
-	blockCtx, blockCancel := context.WithTimeout(ctx, 30*time.Minute)
+	// Create a per-block context with configurable timeout
+	var blockCtx context.Context
+	var blockCancel context.CancelFunc
+
+	if config.blockTimeout > 0 {
+		// Use configurable timeout
+		blockCtx, blockCancel = context.WithTimeout(ctx, config.blockTimeout)
+		level.Debug(logger).Log("msg", "Using block timeout", "block", blockID.String(), "timeout", config.blockTimeout)
+	} else {
+		// No timeout - let individual blob operations handle their own timeouts
+		blockCtx, blockCancel = context.WithCancel(ctx)
+		level.Debug(logger).Log("msg", "No block timeout configured", "block", blockID.String())
+	}
 	defer blockCancel()
 
 	// Check if block already exists in destination
