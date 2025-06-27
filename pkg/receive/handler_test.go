@@ -662,7 +662,7 @@ func testReceiveQuorum(t *testing.T, hashringAlgo HashringAlgorithm, withConsist
 					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-				 appender: newFakeAppender(nil, nil, nil),
+					appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
