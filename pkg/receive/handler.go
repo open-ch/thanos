@@ -1096,11 +1096,40 @@ func isConflict(err error) bool {
 	if err == nil {
 		return false
 	}
-	return err == errConflict ||
+
+	// Check direct error matches
+	if err == errConflict ||
 		isSampleConflictErr(err) ||
 		isExemplarConflictErr(err) ||
-		isLabelsConflictErr(err) ||
-		status.Code(err) == codes.AlreadyExists
+		isLabelsConflictErr(err) {
+		return true
+	}
+
+	// Check gRPC status code - this handles the primary case from the issue
+	if status.Code(err) == codes.AlreadyExists {
+		return true
+	}
+
+	// For wrapped errors, we need to check if the underlying cause has AlreadyExists status
+	// This handles the case where AlreadyExists errors are wrapped multiple times
+	cause := errors.Cause(err)
+	if status.Code(cause) == codes.AlreadyExists {
+		return true
+	}
+
+	// Additional check for MultiError - if any error in the chain is a conflict, consider it a conflict
+	// This handles the nested MultiError case mentioned in the issue
+	if merr, ok := err.(interface{ Unwrap() []error }); ok {
+		if errs := merr.Unwrap(); errs != nil {
+			for _, e := range errs {
+				if isConflict(e) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 // isSampleConflictErr returns whether or not the given error represents
@@ -1130,15 +1159,52 @@ func isLabelsConflictErr(err error) bool {
 
 // isNotReady returns whether or not the given error represents a not ready error.
 func isNotReady(err error) bool {
-	return err == errNotReady ||
-		err == tsdb.ErrNotReady ||
-		status.Code(err) == codes.Unavailable
+	if err == nil {
+		return false
+	}
+
+	// Check direct error matches and use errors.Is for wrapped errors
+	if errors.Is(err, errNotReady) || errors.Is(err, tsdb.ErrNotReady) {
+		return true
+	}
+
+	// Check gRPC status code
+	if status.Code(err) == codes.Unavailable {
+		return true
+	}
+
+	// For wrapped errors, check if the underlying cause has the correct status
+	cause := errors.Cause(err)
+	if status.Code(cause) == codes.Unavailable {
+		return true
+	}
+
+	return false
 }
 
 // isUnavailable returns whether or not the given error represents an unavailable error.
 func isUnavailable(err error) bool {
-	return err == errUnavailable ||
-		status.Code(err) == codes.Unavailable
+	if err == nil {
+		return false
+	}
+
+	// Check direct error matches and use errors.Is for wrapped errors
+	if errors.Is(err, errUnavailable) {
+		return true
+	}
+
+	// Check gRPC status code
+	if status.Code(err) == codes.Unavailable {
+		return true
+	}
+
+	// For wrapped errors, check if the underlying cause has the correct status
+	cause := errors.Cause(err)
+	if status.Code(cause) == codes.Unavailable {
+		return true
+	}
+
+	return false
 }
 
 // retryState encapsulates the number of request attempt made against a peer and,

@@ -42,6 +42,8 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -660,7 +662,7 @@ func testReceiveQuorum(t *testing.T, hashringAlgo HashringAlgorithm, withConsist
 					appender: newFakeAppender(nil, nil, nil),
 				},
 				{
-					appender: newFakeAppender(nil, nil, nil),
+				 appender: newFakeAppender(nil, nil, nil),
 				},
 			},
 		},
@@ -1954,4 +1956,86 @@ func TestHandlerFlippingHashrings(t *testing.T) {
 	<-time.After(1 * time.Second)
 	cancel()
 	wg.Wait()
+}
+
+func TestIsConflictWrappedErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		expectMatch bool
+	}{
+		{
+			name:        "direct AlreadyExists gRPC error",
+			err:         status.Error(codes.AlreadyExists, "already exists"),
+			expectMatch: true,
+		},
+		{
+			name:        "wrapped AlreadyExists gRPC error",
+			err:         errors.Wrap(status.Error(codes.AlreadyExists, "already exists"), "wrapped error"),
+			expectMatch: true,
+		},
+		{
+			name:        "double wrapped AlreadyExists gRPC error",
+			err:         errors.Wrap(errors.Wrap(status.Error(codes.AlreadyExists, "already exists"), "first wrap"), "second wrap"),
+			expectMatch: true,
+		},
+		{
+			name: "triple wrapped AlreadyExists gRPC error (as seen in issue #5407)",
+			err: errors.Wrapf(
+				errors.Wrapf(
+					status.Error(codes.AlreadyExists, "store locally for endpoint conflict"),
+					"forwarding request to endpoint %v", "test-endpoint"),
+				"replicate write request for endpoint %v", "test-endpoint"),
+			expectMatch: true,
+		},
+		{
+			name:        "non-conflict error",
+			err:         status.Error(codes.Internal, "internal error"),
+			expectMatch: false,
+		},
+		{
+			name:        "wrapped non-conflict error",
+			err:         errors.Wrap(status.Error(codes.Internal, "internal error"), "wrapped"),
+			expectMatch: false,
+		},
+		{
+			name:        "nil error",
+			err:         nil,
+			expectMatch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isConflict(tt.err)
+			if result != tt.expectMatch {
+				t.Errorf("isConflict(%v) = %v, want %v", tt.err, result, tt.expectMatch)
+			}
+		})
+	}
+}
+
+// TestReplicationErrorsWithWrappedConflicts tests that replicationErrors
+// properly identifies wrapped conflict errors and returns the correct cause
+func TestReplicationErrorsWithWrappedConflicts(t *testing.T) {
+	// Create a scenario similar to the one described in issue #5407
+	// where we have replication factor 2, and one request fails with wrapped AlreadyExists
+	re := &replicationErrors{
+		threshold: 1, // With RF=2, quorum is 1, so threshold should be 1
+	}
+
+	// Add a wrapped AlreadyExists error (as would happen in the fanout scenario)
+	wrappedConflictErr := errors.Wrapf(
+		errors.Wrapf(
+			status.Error(codes.AlreadyExists, "store locally for endpoint conflict"),
+			"forwarding request to endpoint %v", "test-endpoint"),
+		"replicate write request for endpoint %v", "test-endpoint")
+
+	re.Add(wrappedConflictErr)
+
+	// The Cause() method should return errConflict, not errInternal
+	cause := re.Cause()
+	if cause != errConflict {
+		t.Errorf("replicationErrors.Cause() = %v, want %v", cause, errConflict)
+	}
 }
