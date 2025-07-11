@@ -200,34 +200,24 @@ func (s *ProxyStore) LabelSet() []labelpb.ZLabelSet {
 		return []labelpb.ZLabelSet{}
 	}
 
-	// Debug logging to understand what's happening
-	level.Debug(s.logger).Log("msg", "ProxyStore.LabelSet() called", "num_stores", len(stores), "tsdb_selector_type", fmt.Sprintf("%T", s.tsdbSelector))
-
 	mergedLabelSets := make(map[uint64]labelpb.ZLabelSet, len(stores))
-	for i, st := range stores {
-		originalLabelSets := st.LabelSets()
-		level.Debug(s.logger).Log("msg", "Processing store", "store_index", i, "store", st.String(), "original_label_sets", len(originalLabelSets))
-		
+	for _, st := range stores {
 		// Apply TSDBSelector filtering to each individual label set
 		matches, filteredLabelSets := s.tsdbSelector.MatchLabelSets(st.LabelSets()...)
-		level.Debug(s.logger).Log("msg", "TSDBSelector result", "store_index", i, "matches", matches, "filtered_count", len(filteredLabelSets))
 		
 		if !matches {
-			level.Debug(s.logger).Log("msg", "Store filtered out by TSDBSelector", "store_index", i)
 			continue
 		}
+		
 		// Use the filtered label sets if available, otherwise use original
 		var labelSetsToProcess []labels.Labels
 		if filteredLabelSets != nil {
 			labelSetsToProcess = filteredLabelSets
-			level.Debug(s.logger).Log("msg", "Using filtered label sets", "store_index", i, "count", len(filteredLabelSets))
 		} else {
 			labelSetsToProcess = st.LabelSets()
-			level.Debug(s.logger).Log("msg", "Using original label sets", "store_index", i, "count", len(labelSetsToProcess))
 		}
 		
-		for j, lset := range labelSetsToProcess {
-			level.Debug(s.logger).Log("msg", "Processing label set", "store_index", i, "labelset_index", j, "labels", lset.String())
+		for _, lset := range labelSetsToProcess {
 			mergedLabelSet := labelpb.ExtendSortedLabels(lset, s.selectorLabels)
 			mergedLabelSets[mergedLabelSet.Hash()] = labelpb.ZLabelSet{Labels: labelpb.ZLabelsFromPromLabels(mergedLabelSet)}
 		}
@@ -237,8 +227,6 @@ func (s *ProxyStore) LabelSet() []labelpb.ZLabelSet {
 	for _, v := range mergedLabelSets {
 		labelSets = append(labelSets, v)
 	}
-
-	level.Debug(s.logger).Log("msg", "ProxyStore.LabelSet() returning", "final_count", len(labelSets))
 
 	// We always want to enforce announcing the subset of data that
 	// selector-labels represents. If no label-sets are announced by the
