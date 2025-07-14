@@ -498,6 +498,14 @@ func runRule(
 		// Use a separate queryable to restore the ALERTS firing states.
 		// We cannot use remoteStore directly because it uses remote read for
 		// query. However, remote read is not implemented in Thanos Receiver.
+		level.Info(logger).Log(
+			"msg", "ruler running in stateless mode - will use query API for alert state restoration",
+			"query_endpoints", len(queryClients),
+			"prom_clients", len(promClients),
+			"ignored_labels_for_restore", strings.Join(conf.ignoredLabelNames, ","),
+			"outage_tolerance", conf.outageTolerance,
+			"for_grace_period", conf.forGracePeriod,
+		)
 		queryable = thanosrules.NewPromClientsQueryable(logger, queryClients, promClients, conf.query.httpMethod, conf.query.step, conf.ignoredLabelNames)
 	} else {
 		tsdbDB, err = tsdb.Open(conf.dataDir, logutil.GoKitLogToSlog(log.With(logger, "component", "tsdb")), reg, tsdbOpts, nil)

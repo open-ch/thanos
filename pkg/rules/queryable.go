@@ -5,6 +5,7 @@ package rules
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"net/url"
 	"strings"
@@ -83,26 +84,84 @@ func (q *promClientsQueryable) Querier(mint, maxt int64) (storage.Querier, error
 func (q *promClientsQuerier) Select(ctx context.Context, _ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	query := storepb.PromMatchersToString(matchers...)
 
+	// Enhanced logging for alert state restoration queries
+	isAlertsForStateQuery := strings.Contains(query, "ALERTS_FOR_STATE")
+
+	if isAlertsForStateQuery {
+		level.Info(q.logger).Log(
+			"msg", "executing alert state restoration query",
+			"query", query,
+			"time_range", fmt.Sprintf("%d to %d", q.mint, q.maxt),
+			"time_range_human", fmt.Sprintf("%s to %s",
+				time.Unix(q.mint/1000, 0).Format(time.RFC3339),
+				time.Unix(q.maxt/1000, 0).Format(time.RFC3339)),
+			"step", q.step,
+			"ignored_labels", strings.Join(q.restoreIgnoreLabels, ","),
+		)
+	} else {
+		level.Debug(q.logger).Log(
+			"msg", "executing query via promClientsQuerier",
+			"query", query,
+			"time_range", fmt.Sprintf("%d to %d", q.mint, q.maxt),
+		)
+	}
+
 	for _, i := range rand.Perm(len(q.queryClients)) {
 		promClient := q.promClients[i]
 		endpoints := RemoveDuplicateQueryEndpoints(q.logger, q.duplicatedQuery, q.queryClients[i].Endpoints())
 		for _, i := range rand.Perm(len(endpoints)) {
+			if isAlertsForStateQuery {
+				level.Info(q.logger).Log(
+					"msg", "trying alert state restoration query on endpoint",
+					"endpoint", endpoints[i].String(),
+					"query", query,
+				)
+			}
+
 			m, warns, _, err := promClient.QueryRange(ctx, endpoints[i], query, q.mint, q.maxt, q.step, promclient.QueryOptions{
 				Deduplicate: true,
 				Method:      q.httpMethod,
 			})
 
 			if err != nil {
-				level.Error(q.logger).Log("err", err, "query", q)
+				if isAlertsForStateQuery {
+					level.Error(q.logger).Log(
+						"msg", "alert state restoration query failed",
+						"err", err,
+						"query", query,
+						"endpoint", endpoints[i].String(),
+					)
+				} else {
+					level.Error(q.logger).Log("err", err, "query", query)
+				}
 				continue
 			}
 			if len(warns) > 0 {
-				level.Warn(q.logger).Log("warnings", strings.Join(warns, ", "), "query", q)
+				level.Warn(q.logger).Log("warnings", strings.Join(warns, ", "), "query", query)
 			}
+
 			matrix := make([]*model.SampleStream, 0, m.Len())
 			for _, metric := range m {
+				// Log original labels before filtering
+				if isAlertsForStateQuery {
+					level.Debug(q.logger).Log(
+						"msg", "found ALERTS_FOR_STATE series before label filtering",
+						"labels", metric.Metric.String(),
+						"values_count", len(metric.Values),
+					)
+				}
+
 				for _, label := range q.restoreIgnoreLabels {
 					delete(metric.Metric, model.LabelName(label))
+				}
+
+				// Log labels after filtering
+				if isAlertsForStateQuery {
+					level.Debug(q.logger).Log(
+						"msg", "ALERTS_FOR_STATE series after label filtering",
+						"labels", metric.Metric.String(),
+						"values_count", len(metric.Values),
+					)
 				}
 
 				matrix = append(matrix, &model.SampleStream{
@@ -111,9 +170,26 @@ func (q *promClientsQuerier) Select(ctx context.Context, _ bool, _ *storage.Sele
 				})
 			}
 
+			if isAlertsForStateQuery {
+				level.Info(q.logger).Log(
+					"msg", "alert state restoration query completed",
+					"query", query,
+					"series_found", len(matrix),
+					"endpoint", endpoints[i].String(),
+				)
+			}
+
 			return series.MatrixToSeriesSet(matrix)
 		}
 	}
+
+	if isAlertsForStateQuery {
+		level.Warn(q.logger).Log(
+			"msg", "alert state restoration query found no results",
+			"query", query,
+		)
+	}
+
 	return storage.NoopSeriesSet()
 }
 
