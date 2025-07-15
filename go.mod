@@ -276,6 +276,9 @@ replace (
 	// Required by Cortex https://github.com/cortexproject/cortex/pull/3051.
 	github.com/bradfitz/gomemcache => github.com/themihai/gomemcache v0.0.0-20180902122335-24332e2d58ab
 
+	// Based on feature/add-logging-thanos-0.35.1
+	github.com/prometheus/prometheus => github.com/denysvitali/prometheus v0.0.0-20250715123812-04eb1586496b
+
 	github.com/vimeo/galaxycache => github.com/thanos-community/galaxycache v0.0.0-20211122094458-3a32041a1f1e
 
 	// Override due to https://github.com/weaveworks/common/issues/239
