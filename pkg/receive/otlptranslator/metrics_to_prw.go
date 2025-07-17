@@ -76,116 +76,134 @@ func (c *PrometheusConverter) FromMetrics(ctx context.Context, md pmetric.Metric
 	for i := 0; i < resourceMetricsSlice.Len(); i++ {
 		resourceMetrics := resourceMetricsSlice.At(i)
 		resource := resourceMetrics.Resource()
-		scopeMetricsSlice := resourceMetrics.ScopeMetrics()
-		// keep track of the most recent timestamp in the ResourceMetrics for
-		// use with the "target" info metric
-		var mostRecentTimestamp pcommon.Timestamp
-		for j := 0; j < scopeMetricsSlice.Len(); j++ {
-			metricSlice := scopeMetricsSlice.At(j).Metrics()
-
-			// TODO: decide if instrumentation library information should be exported as labels
-			for k := 0; k < metricSlice.Len(); k++ {
-				if err := c.everyN.checkContext(ctx); err != nil {
-					errs.Add(err)
-					return
-				}
-
-				metric := metricSlice.At(k)
-				mostRecentTimestamp = max(mostRecentTimestamp, mostRecentTimestampInMetric(metric))
-
-				if !isValidAggregationTemporality(metric) {
-					errs.Add(fmt.Errorf("invalid temporality for metric %q", metric.Name()))
-					continue
-				}
-
-				promName := BuildCompliantName(metric, settings.Namespace, settings.AddMetricSuffixes, settings.AllowUTF8)
-				c.metadata = append(c.metadata, prompb.MetricMetadata{
-					Type:             otelMetricTypeToPromMetricType(metric),
-					MetricFamilyName: promName,
-					Help:             metric.Description(),
-					Unit:             metric.Unit(),
-				})
-
-				// handle individual metrics based on type
-				//exhaustive:enforce
-				switch metric.Type() {
-				case pmetric.MetricTypeGauge:
-					dataPoints := metric.Gauge().DataPoints()
-					if dataPoints.Len() == 0 {
-						errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
-						break
-					}
-					if err := c.addGaugeNumberDataPoints(ctx, dataPoints, resource, settings, promName); err != nil {
-						errs.Add(err)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							return
-						}
-					}
-				case pmetric.MetricTypeSum:
-					dataPoints := metric.Sum().DataPoints()
-					if dataPoints.Len() == 0 {
-						errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
-						break
-					}
-					if err := c.addSumNumberDataPoints(ctx, dataPoints, resource, metric, settings, promName); err != nil {
-						errs.Add(err)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							return
-						}
-					}
-				case pmetric.MetricTypeHistogram:
-					dataPoints := metric.Histogram().DataPoints()
-					if dataPoints.Len() == 0 {
-						errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
-						break
-					}
-					if err := c.addHistogramDataPoints(ctx, dataPoints, resource, settings, promName); err != nil {
-						errs.Add(err)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							return
-						}
-					}
-				case pmetric.MetricTypeExponentialHistogram:
-					dataPoints := metric.ExponentialHistogram().DataPoints()
-					if dataPoints.Len() == 0 {
-						errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
-						break
-					}
-					ws, err := c.addExponentialHistogramDataPoints(
-						ctx,
-						dataPoints,
-						resource,
-						settings,
-						promName,
-					)
-					annots.Merge(ws)
-					if err != nil {
-						errs.Add(err)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							return
-						}
-					}
-				case pmetric.MetricTypeSummary:
-					dataPoints := metric.Summary().DataPoints()
-					if dataPoints.Len() == 0 {
-						errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
-						break
-					}
-					if err := c.addSummaryDataPoints(ctx, dataPoints, resource, settings, promName); err != nil {
-						errs.Add(err)
-						if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-							return
-						}
-					}
-				default:
-					errs.Add(errors.New("unsupported metric type"))
-				}
-			}
-		}
-		addResourceTargetInfo(resource, settings, mostRecentTimestamp, c)
+		c.processResourceMetricSlice(ctx, &resourceMetrics, &resource, &settings, annots)
 	}
 
 	return annots, errs
+}
+
+func (c *PrometheusConverter) processResourceMetricSlice(
+	ctx context.Context,
+	resourceMetrics *pmetric.ResourceMetrics,
+	resource *pcommon.Resource,
+	settings *Settings,
+	annots annotations.Annotations,
+) (errs errutil.MultiError) {
+	ctx, span := tracer.Start(ctx, "parseResourceMetricsSlice",
+		oteltrace.WithAttributes(
+			attribute.Int("scope_metrics.length", resourceMetrics.ScopeMetrics().Len()),
+		),
+	)
+	defer span.End()
+	errs = []error{}
+	scopeMetricsSlice := resourceMetrics.ScopeMetrics()
+	// keep track of the most recent timestamp in the ResourceMetrics for
+	// use with the "target" info metric
+	var mostRecentTimestamp pcommon.Timestamp
+	for j := 0; j < scopeMetricsSlice.Len(); j++ {
+		metricSlice := scopeMetricsSlice.At(j).Metrics()
+
+		// TODO: decide if instrumentation library information should be exported as labels
+		for k := 0; k < metricSlice.Len(); k++ {
+			if err := c.everyN.checkContext(ctx); err != nil {
+				errs.Add(err)
+				return
+			}
+
+			metric := metricSlice.At(k)
+			mostRecentTimestamp = max(mostRecentTimestamp, mostRecentTimestampInMetric(metric))
+
+			if !isValidAggregationTemporality(metric) {
+				errs.Add(fmt.Errorf("invalid temporality for metric %q", metric.Name()))
+				continue
+			}
+
+			promName := BuildCompliantName(metric, settings.Namespace, settings.AddMetricSuffixes, settings.AllowUTF8)
+			c.metadata = append(c.metadata, prompb.MetricMetadata{
+				Type:             otelMetricTypeToPromMetricType(metric),
+				MetricFamilyName: promName,
+				Help:             metric.Description(),
+				Unit:             metric.Unit(),
+			})
+
+			// handle individual metrics based on type
+			//exhaustive:enforce
+			switch metric.Type() {
+			case pmetric.MetricTypeGauge:
+				dataPoints := metric.Gauge().DataPoints()
+				if dataPoints.Len() == 0 {
+					errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
+					break
+				}
+				if err := c.addGaugeNumberDataPoints(ctx, dataPoints, resource, settings, promName); err != nil {
+					errs.Add(err)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+				}
+			case pmetric.MetricTypeSum:
+				dataPoints := metric.Sum().DataPoints()
+				if dataPoints.Len() == 0 {
+					errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
+					break
+				}
+				if err := c.addSumNumberDataPoints(ctx, dataPoints, resource, metric, settings, promName); err != nil {
+					errs.Add(err)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+				}
+			case pmetric.MetricTypeHistogram:
+				dataPoints := metric.Histogram().DataPoints()
+				if dataPoints.Len() == 0 {
+					errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
+					break
+				}
+				if err := c.addHistogramDataPoints(ctx, dataPoints, resource, settings, promName); err != nil {
+					errs.Add(err)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+				}
+			case pmetric.MetricTypeExponentialHistogram:
+				dataPoints := metric.ExponentialHistogram().DataPoints()
+				if dataPoints.Len() == 0 {
+					errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
+					break
+				}
+				ws, err := c.addExponentialHistogramDataPoints(
+					ctx,
+					dataPoints,
+					resource,
+					settings,
+					promName,
+				)
+				annots.Merge(ws)
+				if err != nil {
+					errs.Add(err)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+				}
+			case pmetric.MetricTypeSummary:
+				dataPoints := metric.Summary().DataPoints()
+				if dataPoints.Len() == 0 {
+					errs.Add(fmt.Errorf("empty data points. %s is dropped", metric.Name()))
+					break
+				}
+				if err := c.addSummaryDataPoints(ctx, dataPoints, resource, settings, promName); err != nil {
+					errs.Add(err)
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+				}
+			default:
+				errs.Add(errors.New("unsupported metric type"))
+			}
+		}
+	}
+	addResourceTargetInfo(resource, settings, mostRecentTimestamp, c)
+	return nil
 }
 
 func isSameMetric(ts *prompb.TimeSeries, lbls []labelpb.ZLabel) bool {

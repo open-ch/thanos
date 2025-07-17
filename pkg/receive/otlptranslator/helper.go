@@ -107,7 +107,7 @@ var seps = []byte{'\xff'}
 // Unpaired string values are ignored. String pairs overwrite OTLP labels if collisions happen and
 // if logOnOverwrite is true, the overwrite is logged. Resulting label names are sanitized.
 // If settings.PromoteResourceAttributes is not empty, it's a set of resource attributes that should be promoted to labels.
-func createAttributes(resource pcommon.Resource, attributes pcommon.Map, settings Settings,
+func createAttributes(resource *pcommon.Resource, attributes pcommon.Map, settings *Settings,
 	ignoreAttrs []string, logOnOverwrite bool, extras ...string) []labelpb.ZLabel {
 	resourceAttrs := resource.Attributes()
 	serviceName, haveServiceName := resourceAttrs.Get(conventions.AttributeServiceName)
@@ -240,7 +240,7 @@ func isValidAggregationTemporality(metric pmetric.Metric) bool {
 // However, work is under way to resolve this shortcoming through a feature called native histograms custom buckets:
 // https://github.com/prometheus/prometheus/issues/13485.
 func (c *PrometheusConverter) addHistogramDataPoints(ctx context.Context, dataPoints pmetric.HistogramDataPointSlice,
-	resource pcommon.Resource, settings Settings, baseName string) error {
+	resource *pcommon.Resource, settings *Settings, baseName string) error {
 	for x := 0; x < dataPoints.Len(); x++ {
 		if err := c.everyN.checkContext(ctx); err != nil {
 			return err
@@ -439,21 +439,21 @@ func mostRecentTimestampInMetric(metric pmetric.Metric) pcommon.Timestamp {
 	return ts
 }
 
-func (c *PrometheusConverter) addSummaryDataPoints(ctx context.Context, dataPoints pmetric.SummaryDataPointSlice, resource pcommon.Resource,
-	settings Settings, baseName string) error {
+func (c *PrometheusConverter) addSummaryDataPoints(ctx context.Context, dataPoints pmetric.SummaryDataPointSlice, resource *pcommon.Resource,
+	settings *Settings, baseName string) error {
 	for x := 0; x < dataPoints.Len(); x++ {
 		if err := c.everyN.checkContext(ctx); err != nil {
 			return err
 		}
 
 		pt := dataPoints.At(x)
-		timestamp := convertTimeStamp(pt.Timestamp())
+		ts := convertTimeStamp(pt.Timestamp())
 		baseLabels := createAttributes(resource, pt.Attributes(), settings, nil, false)
 
 		// treat sum as a sample in an individual TimeSeries
 		sum := &prompb.Sample{
 			Value:     pt.Sum(),
-			Timestamp: timestamp,
+			Timestamp: ts,
 		}
 		if pt.Flags().NoRecordedValue() {
 			sum.Value = math.Float64frombits(value.StaleNaN)
@@ -465,7 +465,7 @@ func (c *PrometheusConverter) addSummaryDataPoints(ctx context.Context, dataPoin
 		// treat count as a sample in an individual TimeSeries
 		count := &prompb.Sample{
 			Value:     float64(pt.Count()),
-			Timestamp: timestamp,
+			Timestamp: ts,
 		}
 		if pt.Flags().NoRecordedValue() {
 			count.Value = math.Float64frombits(value.StaleNaN)
@@ -478,7 +478,7 @@ func (c *PrometheusConverter) addSummaryDataPoints(ctx context.Context, dataPoin
 			qt := pt.QuantileValues().At(i)
 			quantile := &prompb.Sample{
 				Value:     qt.Value(),
-				Timestamp: timestamp,
+				Timestamp: ts,
 			}
 			if pt.Flags().NoRecordedValue() {
 				quantile.Value = math.Float64frombits(value.StaleNaN)
@@ -568,7 +568,7 @@ func (c *PrometheusConverter) addTimeSeriesIfNeeded(lbls []labelpb.ZLabel, start
 }
 
 // addResourceTargetInfo converts the resource to the target info metric.
-func addResourceTargetInfo(resource pcommon.Resource, settings Settings, timestamp pcommon.Timestamp, converter *PrometheusConverter) {
+func addResourceTargetInfo(resource *pcommon.Resource, settings *Settings, timestamp pcommon.Timestamp, converter *PrometheusConverter) {
 	if settings.DisableTargetInfo || timestamp == 0 {
 		return
 	}
