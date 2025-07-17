@@ -195,7 +195,7 @@ func TestCreateAttributes(t *testing.T) {
 			settings := Settings{
 				PromoteResourceAttributes: tc.promoteResourceAttributes,
 			}
-			lbls := createAttributes(resource, attrs, settings, tc.ignoreAttrs, false, model.MetricNameLabel, "test_metric")
+			lbls := createAttributes(&resource, attrs, &settings, tc.ignoreAttrs, false, model.MetricNameLabel, "test_metric")
 
 			assert.ElementsMatch(t, lbls, tc.expectedLabels)
 		})
@@ -312,12 +312,12 @@ func TestPrometheusConverter_AddSummaryDataPoints(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			metric := tt.metric()
 			converter := NewPrometheusConverter()
-
+			res := pcommon.NewResource()
 			_ = converter.addSummaryDataPoints(
 				context.Background(),
 				metric.Summary().DataPoints(),
-				pcommon.NewResource(),
-				Settings{
+				&res,
+				&Settings{
 					ExportCreatedMetric: true,
 				},
 				metric.Name(),
@@ -423,12 +423,12 @@ func TestPrometheusConverter_AddHistogramDataPoints(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			metric := tt.metric()
 			converter := NewPrometheusConverter()
-
+			res := pcommon.NewResource()
 			_ = converter.addHistogramDataPoints(
 				context.Background(),
 				metric.Histogram().DataPoints(),
-				pcommon.NewResource(),
-				Settings{
+				&res,
+				&Settings{
 					ExportCreatedMetric: true,
 				},
 				metric.Name(),
