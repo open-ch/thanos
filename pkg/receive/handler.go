@@ -35,6 +35,7 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
@@ -724,7 +725,7 @@ type remoteWriteParams struct {
 }
 
 func (h *Handler) gatherWriteStats(rf int, writes ...map[endpointReplica]map[string]trackedSeries) tenantRequestStats {
-	var stats tenantRequestStats = make(tenantRequestStats)
+	var stats = make(tenantRequestStats)
 
 	for _, write := range writes {
 		for er := range write {
@@ -781,7 +782,7 @@ func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (
 	}
 	requestLogger := log.With(h.logger, logTags...)
 
-	localWrites, remoteWrites, err := h.distributeTimeseriesToReplicas(params.tenant, params.replicas, params.writeRequest.Timeseries)
+	localWrites, remoteWrites, err := h.distributeTimeseriesToReplicas(nil, params.tenant, params.replicas, params.writeRequest.Timeseries)
 	if err != nil {
 		level.Error(requestLogger).Log("msg", "failed to distribute timeseries to replicas", "err", err)
 		return stats, err
@@ -863,10 +864,18 @@ func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (
 // The first return value are the series that should be written to the local node. The second return value are the
 // series that should be written to remote nodes.
 func (h *Handler) distributeTimeseriesToReplicas(
+	ctx context.Context,
 	tenantHTTP string,
 	replicas []uint64,
 	timeseries []prompb.TimeSeries,
 ) (map[endpointReplica]map[string]trackedSeries, map[endpointReplica]map[string]trackedSeries, error) {
+	ctx, span := tracer.Start(ctx, "Handler.distributeTimeseriesToReplicas",
+		trace.WithAttributes(
+			attribute.Int("replicas", len(replicas)),
+			attribute.Int("timeseries", len(timeseries)),
+		),
+	)
+	defer span.End()
 	h.mtx.RLock()
 	defer h.mtx.RUnlock()
 	remoteWrites := make(map[endpointReplica]map[string]trackedSeries)
@@ -930,6 +939,13 @@ func (h *Handler) sendWrites(
 	remoteWrites map[endpointReplica]map[string]trackedSeries,
 	responses chan writeResponse,
 ) {
+	ctx, span := tracer.Start(ctx, "Handler.sendWrites",
+		trace.WithAttributes(
+			attribute.Int("local_writes", len(localWrites)),
+			attribute.Int("remote_writes", len(remoteWrites)),
+		),
+	)
+	defer span.End()
 	// Do the writes to the local node first. This should be easy and fast.
 	for writeDestination := range localWrites {
 		func(writeDestination endpointReplica) {
@@ -943,7 +959,6 @@ func (h *Handler) sendWrites(
 	for writeDestination := range remoteWrites {
 		for tenant, trackedSeries := range remoteWrites[writeDestination] {
 			wg.Add(1)
-
 			h.sendRemoteWrite(ctx, tenant, writeDestination, trackedSeries, params.alreadyReplicated, responses, wg)
 		}
 	}
@@ -1000,6 +1015,14 @@ func (h *Handler) sendRemoteWrite(
 	responses chan writeResponse,
 	wg *sync.WaitGroup,
 ) {
+	ctx, span := tracer.Start(ctx, "Handler.sendRemoteWrite",
+		trace.WithAttributes(
+			attribute.String("tenant", tenant),
+			attribute.String("endpoint", endpointReplica.endpoint.String()),
+		),
+	)
+	defer span.End()
+
 	endpoint := endpointReplica.endpoint
 	cl, err := h.peers.getConnection(ctx, endpoint)
 	if err != nil {
@@ -1492,6 +1515,12 @@ func (p *peerGroup) close(endpoint Endpoint) error {
 }
 
 func (p *peerGroup) getConnection(ctx context.Context, endpoint Endpoint) (WriteableStoreAsyncClient, error) {
+	ctx, span := tracer.Start(ctx, "peerGroup.getConnection",
+		trace.WithAttributes(
+			attribute.String("endpoint", endpoint.String()),
+		),
+	)
+	defer span.End()
 	if !p.isPeerUp(endpoint) {
 		return nil, errUnavailable
 	}

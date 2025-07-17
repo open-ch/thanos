@@ -1805,18 +1805,14 @@ func TestDistributeSeries(t *testing.T) {
 	hr := &hashringSeenTenants{Hashring: hashring}
 	h.Hashring(hr)
 
-	_, remote, err := h.distributeTimeseriesToReplicas(
-		"foo",
-		[]uint64{0},
-		[]prompb.TimeSeries{
-			{
-				Labels: labelpb.ZLabelsFromPromLabels(labels.FromStrings("a", "b", tenantIDLabelName, "bar")),
-			},
-			{
-				Labels: labelpb.ZLabelsFromPromLabels(labels.FromStrings("b", "a", tenantIDLabelName, "boo")),
-			},
+	_, remote, err := h.distributeTimeseriesToReplicas(nil, "foo", []uint64{0}, []prompb.TimeSeries{
+		{
+			Labels: labelpb.ZLabelsFromPromLabels(labels.FromStrings("a", "b", tenantIDLabelName, "bar")),
 		},
-	)
+		{
+			Labels: labelpb.ZLabelsFromPromLabels(labels.FromStrings("b", "a", tenantIDLabelName, "boo")),
+		},
+	})
 	require.NoError(t, err)
 	require.Len(t, remote, 1)
 	require.Len(t, remote[endpointReplica{endpoint: endpoint, replica: 0}]["bar"].timeSeries, 1)
