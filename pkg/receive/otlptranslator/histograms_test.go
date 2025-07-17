@@ -744,15 +744,16 @@ func TestPrometheusConverter_addExponentialHistogramDataPoints(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			metric := tt.metric()
 
+			res := pcommon.NewResource()
 			converter := NewPrometheusConverter()
 			annots, err := converter.addExponentialHistogramDataPoints(
 				context.Background(),
 				metric.ExponentialHistogram().DataPoints(),
-				pcommon.NewResource(),
-				Settings{
+				&res,
+				&Settings{
 					ExportCreatedMetric: true,
 				},
-				BuildCompliantName(metric, "", true, true),
+				BuildCompliantName(t.Context(), metric, "", true, true),
 			)
 			require.NoError(t, err)
 			require.Empty(t, annots)

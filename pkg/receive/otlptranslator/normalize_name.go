@@ -8,6 +8,7 @@
 package otlptranslator
 
 import (
+	"context"
 	"regexp"
 	"slices"
 	"strings"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/prometheus/prometheus/util/strutil"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // The map to translate OTLP units to Prometheus units
@@ -79,7 +82,15 @@ var perUnitMap = map[string]string{
 // See rules at https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels,
 // https://prometheus.io/docs/practices/naming/#metric-and-label-naming
 // and https://github.com/open-telemetry/opentelemetry-specification/blob/v1.38.0/specification/compatibility/prometheus_and_openmetrics.md#otlp-metric-points-to-prometheus.
-func BuildCompliantName(metric pmetric.Metric, namespace string, addMetricSuffixes, allowUTF8 bool) string {
+func BuildCompliantName(ctx context.Context, metric pmetric.Metric, namespace string, addMetricSuffixes, allowUTF8 bool) string {
+	ctx, span := tracer.Start(ctx, "PrometheusConverter.BuildCompliantName",
+		oteltrace.WithAttributes(
+			attribute.String("namespace", namespace),
+			attribute.Bool("add_metric_suffixes", addMetricSuffixes),
+			attribute.Bool("allow_utf8", allowUTF8),
+		),
+	)
+	defer span.End()
 	// Full normalization following standard Prometheus naming conventions
 	if addMetricSuffixes {
 		return normalizeName(metric, namespace, allowUTF8)
