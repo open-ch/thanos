@@ -8,7 +8,6 @@
 package otlptranslator
 
 import (
-	"context"
 	"regexp"
 	"slices"
 	"strings"
@@ -16,8 +15,6 @@ import (
 
 	"github.com/prometheus/prometheus/util/strutil"
 	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/otel/attribute"
-	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // The map to translate OTLP units to Prometheus units
@@ -73,6 +70,11 @@ var perUnitMap = map[string]string{
 	"y":  "year",
 }
 
+var (
+	// Regexp for metric name characters that should be replaced with _.
+	invalidMetricCharRE = regexp.MustCompile(`[^a-zA-Z0-9:_]`)
+)
+
 // BuildCompliantName builds a Prometheus-compliant metric name for the specified metric.
 //
 // Metric name is prefixed with specified namespace and underscore (if any).
@@ -82,15 +84,7 @@ var perUnitMap = map[string]string{
 // See rules at https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels,
 // https://prometheus.io/docs/practices/naming/#metric-and-label-naming
 // and https://github.com/open-telemetry/opentelemetry-specification/blob/v1.38.0/specification/compatibility/prometheus_and_openmetrics.md#otlp-metric-points-to-prometheus.
-func BuildCompliantName(ctx context.Context, metric pmetric.Metric, namespace string, addMetricSuffixes, allowUTF8 bool) string {
-	ctx, span := tracer.Start(ctx, "PrometheusConverter.BuildCompliantName",
-		oteltrace.WithAttributes(
-			attribute.String("namespace", namespace),
-			attribute.Bool("add_metric_suffixes", addMetricSuffixes),
-			attribute.Bool("allow_utf8", allowUTF8),
-		),
-	)
-	defer span.End()
+func BuildCompliantName(metric pmetric.Metric, namespace string, addMetricSuffixes, allowUTF8 bool) string {
 	// Full normalization following standard Prometheus naming conventions
 	if addMetricSuffixes {
 		return normalizeName(metric, namespace, allowUTF8)
@@ -98,9 +92,6 @@ func BuildCompliantName(ctx context.Context, metric pmetric.Metric, namespace st
 
 	var metricName string
 	if !allowUTF8 {
-		// Regexp for metric name characters that should be replaced with _.
-		invalidMetricCharRE := regexp.MustCompile(`[^a-zA-Z0-9:_]`)
-
 		// Simple case (no full normalization, no units, etc.).
 		metricName = strings.Join(strings.FieldsFunc(metric.Name(), func(r rune) bool {
 			return invalidMetricCharRE.MatchString(string(r))

@@ -121,7 +121,7 @@ func (c *PrometheusConverter) processResourceMetricSlice(
 				continue
 			}
 
-			promName := BuildCompliantName(ctx, metric, settings.Namespace, settings.AddMetricSuffixes, settings.AllowUTF8)
+			promName := BuildCompliantName(metric, settings.Namespace, settings.AddMetricSuffixes, settings.AllowUTF8)
 			c.metadata = append(c.metadata, prompb.MetricMetadata{
 				Type:             otelMetricTypeToPromMetricType(metric),
 				MetricFamilyName: promName,
