@@ -15,6 +15,8 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/thanos-io/thanos/pkg/errutil"
@@ -50,6 +52,15 @@ func NewPrometheusConverter() *PrometheusConverter {
 
 // FromMetrics converts pmetric.Metrics to Prometheus remote write format.
 func (c *PrometheusConverter) FromMetrics(ctx context.Context, md pmetric.Metrics, settings Settings) (annots annotations.Annotations, errs errutil.MultiError) {
+	ctx, span := tracer.Start(ctx, "PrometheusConverter.FromMetrics",
+		oteltrace.WithAttributes(
+			attribute.String("namespace", settings.Namespace),
+			attribute.Int64("resource_metrics.length", int64(md.ResourceMetrics().Len())),
+			attribute.Int64("metric_count", int64(md.MetricCount())),
+			attribute.Int64("datapoint_count", int64(md.DataPointCount())),
+		),
+	)
+	defer span.End()
 	c.everyN = everyNTimes{n: 128}
 	resourceMetricsSlice := md.ResourceMetrics()
 

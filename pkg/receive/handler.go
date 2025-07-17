@@ -35,7 +35,7 @@ import (
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
@@ -1437,8 +1437,8 @@ func (p *peerWorker) RemoteWriteAsync(ctx context.Context, req *storepb.WriteReq
 			)
 			if err != nil {
 				sp := trace.SpanFromContext(ctx)
-				sp.SetAttributes(attribute.Bool("error", true))
-				sp.SetAttributes(attribute.String("error.msg", err.Error()))
+				sp.RecordError(err)
+				sp.SetStatus(otelcodes.Error, "forwarding request failed")
 			}
 			cb(err)
 		}, opentracing.Tags{

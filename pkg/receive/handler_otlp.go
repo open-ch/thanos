@@ -37,8 +37,8 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 	span.SetTag("tenant", tenant)
 
 	writeGate := h.Limiter.WriteGate()
-	tracing.DoInSpan(r.Context(), "receive_write_gate_ismyturn", func(ctx context.Context) {
-		err = writeGate.Start(r.Context())
+	tracing.DoInSpan(ctx, "receive_write_gate_ismyturn", func(ctx context.Context) {
+		err = writeGate.Start(ctx)
 	})
 
 	defer writeGate.Done()
@@ -68,7 +68,7 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req pmetricotlp.ExportRequest
-	err = tracing.DoInSpanWithErr(r.Context(), "receive_decode_otlp_write_request", func(ctx context.Context) error {
+	err = tracing.DoInSpanWithErr(ctx, "receive_decode_otlp_write_request", func(ctx context.Context) error {
 		req, err = remote.DecodeOTLPWriteRequest(r)
 		return err
 	})
@@ -79,7 +79,7 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var metrics []tprompb.TimeSeries
-	if err := tracing.DoInSpanWithErr(r.Context(), "receive_otlp_to_prometheus", func(ctx context.Context) error {
+	if err := tracing.DoInSpanWithErr(ctx, "receive_otlp_to_prometheus", func(ctx context.Context) error {
 		metrics, _, err = h.convertToPrometheusFormat(ctx, req.Metrics())
 		return err
 	}); err != nil {
