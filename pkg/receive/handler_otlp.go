@@ -17,6 +17,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 )
 
 func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
@@ -66,15 +67,22 @@ func (h *Handler) receiveOTLPHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	req, err := remote.DecodeOTLPWriteRequest(r)
+	var req pmetricotlp.ExportRequest
+	err = tracing.DoInSpanWithErr(r.Context(), "receive_decode_otlp_write_request", func(ctx context.Context) error {
+		req, err = remote.DecodeOTLPWriteRequest(r)
+		return err
+	})
 	if err != nil {
 		level.Error(h.logger).Log("msg", "Error decoding remote write request", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	metrics, _, err := h.convertToPrometheusFormat(ctx, req.Metrics())
-	if err != nil {
+	var metrics []tprompb.TimeSeries
+	if err := tracing.DoInSpanWithErr(r.Context(), "receive_otlp_to_prometheus", func(ctx context.Context) error {
+		metrics, _, err = h.convertToPrometheusFormat(ctx, req.Metrics())
+		return err
+	}); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
