@@ -762,10 +762,19 @@ func (h *Handler) gatherWriteStats(rf int, writes ...map[endpointReplica]map[str
 }
 
 func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (tenantRequestStats, error) {
-	ctx, cancel := context.WithTimeout(tracing.CopyTraceContext(context.Background(), ctx), h.options.ForwardTimeout)
+	ctx, span := tracer.Start(ctx, "Handler.fanoutForward",
+		trace.WithAttributes(
+			attribute.String("tenant", params.tenant),
+			attribute.Bool("already_replicated", params.alreadyReplicated),
+			attribute.Int64("timeseries", int64(len(params.writeRequest.Timeseries))),
+			attribute.Int("replicas", len(params.replicas)),
+		),
+	)
+	defer span.End()
+	ctx, cancel := context.WithTimeout(ctx, h.options.ForwardTimeout)
 
 	var writeErrors writeErrors
-	var stats tenantRequestStats = make(tenantRequestStats)
+	var stats = make(tenantRequestStats)
 
 	defer func() {
 		if writeErrors.ErrOrNil() != nil {
@@ -782,7 +791,12 @@ func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (
 	}
 	requestLogger := log.With(h.logger, logTags...)
 
-	localWrites, remoteWrites, err := h.distributeTimeseriesToReplicas(nil, params.tenant, params.replicas, params.writeRequest.Timeseries)
+	localWrites, remoteWrites, err := h.distributeTimeseriesToReplicas(
+		ctx,
+		params.tenant,
+		params.replicas,
+		params.writeRequest.Timeseries,
+	)
 	if err != nil {
 		level.Error(requestLogger).Log("msg", "failed to distribute timeseries to replicas", "err", err)
 		return stats, err
@@ -806,7 +820,9 @@ func (h *Handler) fanoutForward(ctx context.Context, params remoteWriteParams) (
 	h.sendWrites(ctx, &wg, params, localWrites, remoteWrites, responses)
 
 	go func() {
+		span.AddEvent("wg wait")
 		wg.Wait()
+		span.AddEvent("wg wait done")
 		close(responses)
 	}()
 
@@ -973,10 +989,13 @@ func (h *Handler) sendLocalWrite(
 	trackedSeries trackedSeries,
 	responses chan<- writeResponse,
 ) {
-	span, tracingCtx := tracing.StartSpan(ctx, "receive_local_tsdb_write")
-	defer span.Finish()
-	span.SetTag("endpoint", writeDestination.endpoint)
-	span.SetTag("replica", writeDestination.replica)
+	ctx, span := tracer.Start(ctx, "Handler.sendLocalWrite",
+		trace.WithAttributes(
+			attribute.String("endpoint", writeDestination.endpoint.String()),
+			attribute.Int64("replica", int64(writeDestination.replica)),
+		),
+	)
+	defer span.End()
 
 	tenantSeriesMapping := map[string][]prompb.TimeSeries{}
 	for _, ts := range trackedSeries.timeSeries {
@@ -991,16 +1010,15 @@ func (h *Handler) sendLocalWrite(
 	}
 
 	for tenant, series := range tenantSeriesMapping {
-		err := h.writer.Write(tracingCtx, tenant, series)
+		err := h.writer.Write(ctx, tenant, series)
 		if err != nil {
-			span.SetTag("error", true)
-			span.SetTag("error.msg", err.Error())
+			span.RecordError(err)
+			span.SetStatus(otelcodes.Error, err.Error())
 			responses <- newWriteResponse(trackedSeries.seriesIDs, err, writeDestination)
 			return
 		}
 	}
 	responses <- newWriteResponse(trackedSeries.seriesIDs, nil, writeDestination)
-
 }
 
 // sendRemoteWrite sends a write request to the remote node. It takes care of checking whether the endpoint is up or not
