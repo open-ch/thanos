@@ -4,8 +4,6 @@
 package store
 
 import (
-	"sync"
-
 	"github.com/alecthomas/units"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -54,7 +52,6 @@ type Limiter struct {
 
 	// Counter metric which we will increase if limit is exceeded.
 	failedCounter prometheus.Counter
-	failedOnce    sync.Once
 }
 
 // NewLimiter returns a new limiter with a specified limit. 0 disables the limit.
@@ -75,9 +72,11 @@ func (l *Limiter) ReserveWithType(num uint64, _ StoreDataType) error {
 		return nil
 	}
 	if reserved := l.reserved.Add(num); reserved > l.limit {
-		// We need to protect from the counter being incremented twice due to concurrency
-		// while calling Reserve().
-		l.failedOnce.Do(l.failedCounter.Inc)
+		// Previous versions of Thanos used a sync.Once to prevent race conditions. This didn't make sense
+		// as we'll otherwise lose the `error` metric if the limit is hit.
+		// I don't think there was a good reason for this (as a sync.Once increment is pretty useless).
+		// This should now increase the counter every time the limit is hit.
+		l.failedCounter.Inc()
 		return errors.Errorf("limit %v violated (got %v)", l.limit, reserved)
 	}
 	return nil
